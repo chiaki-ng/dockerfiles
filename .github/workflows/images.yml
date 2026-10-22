@@ -1,0 +1,167 @@
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ['*-[0-9][0-9][0-9][0-9][0-9][0-9]']
+    paths-ignore: ['README.md']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Image to build without publishing, such as devkita64'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  REGISTRY: ghcr.io/chiaki-ng
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      images: ${{ steps.plan.outputs.images }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          INPUT_IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          dockerfile_for() {
+            local wanted f
+            wanted=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+            for f in Dockerfile.*; do
+              [ "$(printf '%s' "${f#Dockerfile.}" | tr '[:upper:]' '[:lower:]')" = "$wanted" ] && { printf '%s\n' "$f"; return; }
+            done
+            echo "::error::no Dockerfile.* matches image '$1'" >&2
+            exit 1
+          }
+          publish=false
+          version=""
+          files=""
+          if [ "$REF_TYPE" = tag ]; then
+            image=${REF_NAME%-*}
+            version=${REF_NAME##*-}
+            files=$(dockerfile_for "$image")
+            publish=true
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            files=$(dockerfile_for "$INPUT_IMAGE")
+          else
+            base=${BASE:-$BEFORE}
+            if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              files=$(ls Dockerfile.* 2>/dev/null || true)
+            elif git diff --name-only "$base" HEAD -- .github/workflows/images.yml | grep -q .; then
+              files=$(ls Dockerfile.* 2>/dev/null || true)
+            else
+              files=$(git diff --name-only "$base" HEAD -- 'Dockerfile.*')
+            fi
+          fi
+          matrix=$(for f in $files; do
+            [ -f "$f" ] || continue
+            name=$(printf '%s' "${f#Dockerfile.}" | tr '[:upper:]' '[:lower:]')
+            for arch in amd64 arm64; do
+              runner=ubuntu-24.04
+              [ "$arch" = arm64 ] && runner=ubuntu-24.04-arm
+              jq -cn --arg image "$name" --arg dockerfile "$f" --arg version "$version" --arg arch "$arch" --arg runner "$runner" \
+                '{image: $image, dockerfile: $dockerfile, version: $version, arch: $arch, runner: $runner}'
+            done
+          done | jq -sc '{include: .}')
+          images=$(printf '%s' "$matrix" | jq -c '[.include[] | {image, version}] | unique')
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+          echo "images=$images" >>"$GITHUB_OUTPUT"
+          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          echo "publish=$publish"
+          printf '%s\n' "$matrix" | jq -r '.include[] | "  \(.image) \(.arch) from \(.dockerfile)"'
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.matrix != '{"include":[]}'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - if: needs.plan.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: ${{ needs.plan.outputs.publish == 'true' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, matrix.image) || 'type=cacheonly' }}
+      - if: needs.plan.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - if: needs.plan.outputs.publish == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.images) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the multi-arch tags
+        working-directory: digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            $(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$d"; done)
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          echo "### $IMAGE:$VERSION" >>"$GITHUB_STEP_SUMMARY"
+          echo '```' >>"$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' >>"$GITHUB_STEP_SUMMARY"
+          echo '```' >>"$GITHUB_STEP_SUMMARY"
