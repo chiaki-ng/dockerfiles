@@ -1,15 +1,12 @@
 name: images
 
 on:
-  push:
-    branches: [main]
-    tags: ['*-[0-9][0-9][0-9][0-9][0-9][0-9]']
-    paths-ignore: ['README.md']
-  pull_request:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       image:
-        description: 'Image to build without publishing, such as devkita64'
+        description: 'Dockerfile suffix to build without publishing, such as devkitA64'
         type: string
         required: true
 
@@ -18,7 +15,7 @@ permissions:
 
 concurrency:
   group: images-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io/chiaki-ng
@@ -37,41 +34,30 @@ jobs:
       - id: plan
         env:
           EVENT: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-          BEFORE: ${{ github.event.before }}
-          BASE: ${{ github.event.pull_request.base.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_SHA: ${{ github.sha }}
           INPUT_IMAGE: ${{ inputs.image }}
         run: |
           set -euo pipefail
           dockerfile_for() {
-            local wanted f
-            wanted=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-            for f in Dockerfile.*; do
-              [ "$(printf '%s' "${f#Dockerfile.}" | tr '[:upper:]' '[:lower:]')" = "$wanted" ] && { printf '%s\n' "$f"; return; }
-            done
-            echo "::error::no Dockerfile.* matches image '$1'" >&2
-            exit 1
+            ls -1 | grep -qFx "Dockerfile.$1" \
+              || { echo "::error::no Dockerfile.$1; the release tag must be <suffix>-<ddmmyy> with the Dockerfile's suffix exactly" >&2; exit 1; }
+            printf 'Dockerfile.%s\n' "$1"
           }
           publish=false
           version=""
           files=""
-          if [ "$REF_TYPE" = tag ]; then
-            image=${REF_NAME%-*}
-            version=${REF_NAME##*-}
-            files=$(dockerfile_for "$image")
+          if [ "$EVENT" = release ]; then
+            printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._]+-[0-9]{6}$' \
+              || { echo "::error::release tag '$RELEASE_TAG' must be <suffix>-<ddmmyy>" >&2; exit 1; }
+            git fetch --quiet origin main
+            git merge-base --is-ancestor "$RELEASE_SHA" origin/main \
+              || { echo "::error::release tag $RELEASE_TAG is not on main; refusing to publish" >&2; exit 1; }
+            files=$(dockerfile_for "${RELEASE_TAG%-*}")
+            version=${RELEASE_TAG##*-}
             publish=true
-          elif [ "$EVENT" = workflow_dispatch ]; then
-            files=$(dockerfile_for "$INPUT_IMAGE")
           else
-            base=${BASE:-$BEFORE}
-            if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-              files=$(ls Dockerfile.* 2>/dev/null || true)
-            elif git diff --name-only "$base" HEAD -- .github/workflows/images.yml | grep -q .; then
-              files=$(ls Dockerfile.* 2>/dev/null || true)
-            else
-              files=$(git diff --name-only "$base" HEAD -- 'Dockerfile.*')
-            fi
+            files=$(dockerfile_for "$INPUT_IMAGE")
           fi
           matrix=$(for f in $files; do
             [ -f "$f" ] || continue
@@ -83,7 +69,7 @@ jobs:
                 '{image: $image, dockerfile: $dockerfile, version: $version, arch: $arch, runner: $runner}'
             done
           done | jq -sc '{include: .}')
-          images=$(printf '%s' "$matrix" | jq -c '[.include[] | {image, version}] | unique')
+          images=$(printf '%s' "$matrix" | jq -c '[.include[] | {image, dockerfile, version}] | unique')
           echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
           echo "images=$images" >>"$GITHUB_OUTPUT"
           echo "publish=$publish" >>"$GITHUB_OUTPUT"
@@ -137,31 +123,43 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.images) }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: digest-${{ matrix.image }}-*
           merge-multiple: true
-          path: digests
+          path: ${{ runner.temp }}/digests
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish the multi-arch tags
-        working-directory: digests
+      - name: Publish the multi-arch tags and the release report
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
           VERSION: ${{ matrix.version }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          DIGESTS: ${{ runner.temp }}/digests
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
-            $(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$d"; done)
-          docker buildx imagetools inspect "$IMAGE:$VERSION"
-          echo "### $IMAGE:$VERSION" >>"$GITHUB_STEP_SUMMARY"
-          echo '```' >>"$GITHUB_STEP_SUMMARY"
-          docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' >>"$GITHUB_STEP_SUMMARY"
-          echo '```' >>"$GITHUB_STEP_SUMMARY"
+            $(for d in "$DIGESTS"/*; do printf '%s@sha256:%s ' "$IMAGE" "${d##*/}"; done)
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            printf 'Published `%s:%s` for linux/amd64 and linux/arm64 from `%s`.\n\n' "$IMAGE" "$VERSION" "$DOCKERFILE"
+            printf 'Pin it as:\n\n```\n%s@%s\n```\n\n' "$IMAGE" "$digest"
+            printf 'Built on `%s`.\n\n' "$(sed -n 's/^FROM //p' "$DOCKERFILE" | head -1)"
+            report="report/${DOCKERFILE#Dockerfile.}.sh"
+            if [ -f "$report" ]; then
+              docker run --rm -v "$PWD/report:/report:ro" "$IMAGE@$digest" bash "/report/${report##*/}"
+            fi
+          } >"$notes"
+          gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --notes-file "$notes"
+          cat "$notes" >>"$GITHUB_STEP_SUMMARY"
