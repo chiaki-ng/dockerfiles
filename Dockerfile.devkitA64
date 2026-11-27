@@ -16,6 +16,21 @@ RUN dkp-pacman -Syu --noconfirm \
         switch-cmake \
         switch-dev \
         switch-pkg-config \
+        switch-sdl2 \
+        switch-zlib \
+        switch-bzip2 \
+        switch-freetype \
+        switch-libass \
+        switch-libfribidi \
+        switch-harfbuzz \
+        switch-mesa \
+        switch-glfw \
+        switch-glad \
+        switch-libjson-c \
+        switch-dav1d \
+        switch-libopus \
+        switch-libssh2 \
+        switch-mbedtls \
     && dkp-pacman -Scc --noconfirm \
     && /opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc -dumpversion | grep -q '^16\.'
 
