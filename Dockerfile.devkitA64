@@ -3,7 +3,8 @@ FROM docker.io/devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f8
 LABEL org.opencontainers.image.source="https://github.com/chiaki-ng/dockerfiles"
 LABEL org.opencontainers.image.description="devkitA64 updated to GCC 16 with the Switch build tools"
 
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list.d/devkitpro.list \
+    && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         autoconf automake build-essential bzip2 ca-certificates cmake curl git jq \
         libtool make ninja-build patch perl pkg-config python3 rsync xz-utils zstd \
