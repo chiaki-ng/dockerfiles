@@ -25,7 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      images: ${{ steps.plan.outputs.images }}
+      image: ${{ steps.plan.outputs.image }}
+      dockerfile: ${{ steps.plan.outputs.dockerfile }}
+      layers: ${{ steps.plan.outputs.layers }}
+      layer_matrix: ${{ steps.plan.outputs.layer_matrix }}
+      version: ${{ steps.plan.outputs.version }}
       publish: ${{ steps.plan.outputs.publish }}
     steps:
       - uses: actions/checkout@v7
@@ -45,41 +49,55 @@ jobs:
               || { echo "::error::no Dockerfile.$1; the release tag must be <suffix>-<ddmmyy> with the Dockerfile's suffix exactly" >&2; exit 1; }
             printf 'Dockerfile.%s\n' "$1"
           }
+          image_of() {
+            printf '%s' "${1#Dockerfile.}" | tr '[:upper:]' '[:lower:]'
+          }
+          matrix_for() {
+            for f in "$@"; do
+              for arch in amd64 arm64; do
+                runner=ubuntu-24.04
+                [ "$arch" = arm64 ] && runner=ubuntu-24.04-arm
+                jq -cn --arg image "$(image_of "$f")" --arg dockerfile "$f" --arg arch "$arch" --arg runner "$runner" \
+                  '{image: $image, dockerfile: $dockerfile, arch: $arch, runner: $runner}'
+              done
+            done | jq -sc '{include: .}'
+          }
           publish=false
           version=""
-          files=""
+          layers=()
           if [ "$EVENT" = release ]; then
             printf '%s' "$RELEASE_TAG" | grep -qE '^[A-Za-z0-9._]+-[0-9]{6}$' \
               || { echo "::error::release tag '$RELEASE_TAG' must be <suffix>-<ddmmyy>" >&2; exit 1; }
             git fetch --quiet origin main
             git merge-base --is-ancestor "$RELEASE_SHA" origin/main \
               || { echo "::error::release tag $RELEASE_TAG is not on main; refusing to publish" >&2; exit 1; }
-            files=$(dockerfile_for "${RELEASE_TAG%-*}")
+            file=$(dockerfile_for "${RELEASE_TAG%-*}")
+            if grep -qE "^ARG BASE=$REGISTRY/" "$file"; then
+              echo "::error::$file is layered on another image here and is released with it, not on its own" >&2
+              exit 1
+            fi
+            mapfile -t layers < <(grep -lE "^ARG BASE=$REGISTRY/$(image_of "$file")@" Dockerfile.* || true)
             version=${RELEASE_TAG##*-}
             publish=true
           else
-            files=$(dockerfile_for "$INPUT_IMAGE")
+            file=$(dockerfile_for "$INPUT_IMAGE")
           fi
-          matrix=$(for f in $files; do
-            [ -f "$f" ] || continue
-            name=$(printf '%s' "${f#Dockerfile.}" | tr '[:upper:]' '[:lower:]')
-            for arch in amd64 arm64; do
-              runner=ubuntu-24.04
-              [ "$arch" = arm64 ] && runner=ubuntu-24.04-arm
-              jq -cn --arg image "$name" --arg dockerfile "$f" --arg version "$version" --arg arch "$arch" --arg runner "$runner" \
-                '{image: $image, dockerfile: $dockerfile, version: $version, arch: $arch, runner: $runner}'
-            done
-          done | jq -sc '{include: .}')
-          images=$(printf '%s' "$matrix" | jq -c '[.include[] | {image, dockerfile, version}] | unique')
-          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
-          echo "images=$images" >>"$GITHUB_OUTPUT"
-          echo "publish=$publish" >>"$GITHUB_OUTPUT"
+          layer_images=$(for f in "${layers[@]}"; do jq -cn --arg image "$(image_of "$f")" --arg dockerfile "$f" '{image: $image, dockerfile: $dockerfile}'; done | jq -sc '{include: .}')
+          {
+            echo "matrix=$(matrix_for "$file")"
+            echo "image=$(image_of "$file")"
+            echo "dockerfile=$file"
+            echo "layers=$layer_images"
+            echo "layer_matrix=$(matrix_for "${layers[@]}")"
+            echo "version=$version"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
           echo "publish=$publish"
-          printf '%s\n' "$matrix" | jq -r '.include[] | "  \(.image) \(.arch) from \(.dockerfile)"'
+          echo "image $(image_of "$file") from $file"
+          for f in "${layers[@]}"; do echo "layer $(image_of "$f") from $f"; done
 
   build:
     needs: plan
-    if: needs.plan.outputs.matrix != '{"include":[]}'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -121,17 +139,83 @@ jobs:
   publish:
     needs: [plan, build]
     if: needs.plan.outputs.publish == 'true'
-    strategy:
-      matrix:
-        include: ${{ fromJSON(needs.plan.outputs.images) }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.tag.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ needs.plan.outputs.image }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tag
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.plan.outputs.image }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          DIGESTS: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            $(for d in "$DIGESTS"/*; do printf '%s@sha256:%s ' "$IMAGE" "${d##*/}"; done)
+          echo "digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')" >>"$GITHUB_OUTPUT"
+
+  build-layers:
+    needs: [plan, publish]
+    if: needs.plan.outputs.layer_matrix != '{"include":[]}'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.layer_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: BASE=${{ env.REGISTRY }}/${{ needs.plan.outputs.image }}@${{ needs.publish.outputs.digest }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+      - env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  publish-layers:
+    needs: [plan, build-layers]
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.layers) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
       - uses: actions/download-artifact@v8
         with:
           pattern: digest-${{ matrix.image }}-*
@@ -143,27 +227,64 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish the multi-arch tags and the release report
-        env:
+      - env:
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
-          VERSION: ${{ matrix.version }}
-          DOCKERFILE: ${{ matrix.dockerfile }}
+          VERSION: ${{ needs.plan.outputs.version }}
           DIGESTS: ${{ runner.temp }}/digests
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
             $(for d in "$DIGESTS"/*; do printf '%s@sha256:%s ' "$IMAGE" "${d##*/}"; done)
-          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+
+  notes:
+    needs: [plan, publish, publish-layers]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.publish-layers.result != 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Write the release report
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          DOCKERFILE: ${{ needs.plan.outputs.dockerfile }}
+          BASE_DIGEST: ${{ needs.publish.outputs.digest }}
+          LAYERS: ${{ needs.plan.outputs.layers }}
+          LAYERS_RESULT: ${{ needs.publish-layers.result }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          report() {
+            local image=$1 dockerfile=$2 built_on=$3 digest
+            digest=$(docker buildx imagetools inspect "$REGISTRY/$image:$VERSION" --format '{{.Manifest.Digest}}')
+            printf '## %s\n\n' "$image"
+            printf 'Published `%s/%s:%s` for linux/amd64 and linux/arm64 from `%s`.\n\n' "$REGISTRY" "$image" "$VERSION" "$dockerfile"
+            printf 'Pin it as:\n\n```\n%s/%s@%s\n```\n\n' "$REGISTRY" "$image" "$digest"
+            printf 'Built on `%s`.\n\n' "$built_on"
+            local script="report/${dockerfile#Dockerfile.}.sh"
+            if [ -f "$script" ]; then
+              docker run --rm -v "$PWD/report:/report:ro" "$REGISTRY/$image@$digest" bash "/report/${script##*/}" | sed 's/^## /### /'
+              printf '\n'
+            fi
+          }
           notes="$RUNNER_TEMP/notes.md"
           {
-            printf 'Published `%s:%s` for linux/amd64 and linux/arm64 from `%s`.\n\n' "$IMAGE" "$VERSION" "$DOCKERFILE"
-            printf 'Pin it as:\n\n```\n%s@%s\n```\n\n' "$IMAGE" "$digest"
-            printf 'Built on `%s`.\n\n' "$(sed -n 's/^FROM //p' "$DOCKERFILE" | head -1)"
-            report="report/${DOCKERFILE#Dockerfile.}.sh"
-            if [ -f "$report" ]; then
-              docker run --rm -v "$PWD/report:/report:ro" "$IMAGE@$digest" bash "/report/${report##*/}"
+            report "$IMAGE" "$DOCKERFILE" "$(sed -n 's/^FROM //p' "$DOCKERFILE" | head -1)"
+            if [ "$LAYERS_RESULT" = success ]; then
+              printf '%s' "$LAYERS" | jq -r '.include[] | "\(.image) \(.dockerfile)"' | while read -r layer file; do
+                report "$layer" "$file" "$REGISTRY/$IMAGE@$BASE_DIGEST"
+              done
             fi
           } >"$notes"
           gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --notes-file "$notes"
