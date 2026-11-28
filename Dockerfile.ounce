@@ -29,7 +29,7 @@ RUN git clone -q https://github.com/ouncebrew/uam2.git /tmp/uam2 \
 FROM ${BASE}
 
 LABEL org.opencontainers.image.source="https://github.com/chiaki-ng/dockerfiles"
-LABEL org.opencontainers.image.description="devkita64 with the libounce Switch 2 SDK beside libnx"
+LABEL org.opencontainers.image.description="devkita64 turned into a Switch 2 devkit with libounce in place of libnx"
 
 ARG OUNCE_REPO=https://pkg.ouncebrew.org
 ARG DRAKOTOOLS_COMMIT=b32fe6e43533e80414f6aa4ad3b899ed077f806c
@@ -37,7 +37,7 @@ ARG DRAKO3D_COMMIT=d1f05077667d0eabdd39d8a65483ffcec51807c2
 
 ENV DEVKITPRO=/opt/devkitpro
 ENV DEVKITA64=/opt/devkitpro/devkitA64
-ENV PATH=/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/opt/devkitpro/devkitA64/bin:/opt/devkitpro/portlibs/switch2/bin:/opt/devkitpro/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN rm -f /etc/apt/sources.list.d/devkitpro.list \
     && apt-get update \
@@ -53,9 +53,15 @@ RUN curl -fsSL -o /tmp/ounce.gpg "${OUNCE_REPO}/ounce.gpg" \
     && printf '\n[ounce]\nServer = %s\n' "${OUNCE_REPO}" >> /opt/devkitpro/pacman/etc/pacman.conf \
     && dkp-pacman -Sy --needed --noconfirm libounce ouncevk libkaihen \
     && dkp-pacman -Scc --noconfirm \
-    && test -f "${DEVKITPRO}/libnx/lib/libnx.a" \
-    && test ! -L "${DEVKITPRO}/libnx" \
     && test -f "${DEVKITPRO}/libounce/lib/libounce.a"
+
+RUN dkp-pacman -Qq \
+        | grep -vxE 'devkitA64|devkita64-(binutils|cmake|gcc|newlib|rules)|devkit-env|devkitpro-keyring|dkp-(cmake-common-utils|meson-scripts|toolchain-vars)|general-tools|pacman|switch-(cmake|tools|pkg-config|mbedtls|zlib)|uam|libounce|ouncevk|libkaihen' \
+        | xargs dkp-pacman -Rdd --noconfirm \
+    && rm -rf "${DEVKITPRO}/libnx" "${DEVKITPRO}/examples" \
+    && ln -s libounce "${DEVKITPRO}/libnx" \
+    && test -f "${DEVKITPRO}/portlibs/switch/lib/libmbedtls.a" \
+    && test -z "$(ls "${DEVKITPRO}/portlibs/switch/lib" | grep -vE '^(libmbed(tls|x509|crypto)\.a|lib(z|minizip)\.(a|la)|pkgconfig|cmake)$')"
 
 RUN git clone -q https://github.com/ouncebrew/drakotools.git /tmp/drakotools \
     && git -C /tmp/drakotools checkout -q "${DRAKOTOOLS_COMMIT}" \
@@ -70,14 +76,14 @@ RUN git clone -q https://github.com/ouncebrew/drako3d.git /tmp/drako3d \
     && make -C /tmp/drako3d install LIBNX="${DEVKITPRO}/libounce" \
     && rm -rf /tmp/drako3d \
     && test -f "${DEVKITPRO}/libounce/lib/libdrako3d.a" \
-    && test -f "${DEVKITPRO}/libounce/include/drako3d.hpp" \
-    && test ! -e "${DEVKITPRO}/libnx/lib/libdrako3d.a"
+    && test -f "${DEVKITPRO}/libounce/include/drako3d.hpp"
 
 COPY --from=uam2 /opt/uam2/bin/uam2 /opt/devkitpro/tools/bin/uam2
 
 RUN aarch64-none-elf-gcc -dumpversion | grep -q '^16\.' \
-    && test -f "${DEVKITPRO}/libnx/lib/libnx.a" \
+    && test "$(readlink "${DEVKITPRO}/libnx")" = libounce \
     && test -f "${DEVKITPRO}/libounce/lib/libounce.a" \
+    && test -f "${DEVKITPRO}/portlibs/switch/lib/libmbedtls.a" \
     && test -f "${DEVKITPRO}/libounce/lib/libdrako3d.a" \
     && command -v drakodef && command -v drakomme \
     && printf '#version 460\nlayout (location = 0) out vec4 color;\nvoid main() { color = vec4(1.0); }\n' > /tmp/smoke.glsl \

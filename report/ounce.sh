@@ -13,7 +13,7 @@ printf '| CMake | %s |\n' "$cmake"
 
 printf '\n## Switch SDKs\n\n'
 printf '| SDK | Version |\n| --- | --- |\n'
-for pkg in libnx libounce ouncevk libkaihen; do
+for pkg in libounce ouncevk libkaihen; do
   printf '| %s | %s |\n' "$pkg" "$(dkp-pacman -Q "$pkg" | cut -d' ' -f2)"
 done
 

@@ -15,4 +15,4 @@ Branch pushes, tags without a release and pull requests build nothing. The workf
 | Image | Contents |
 | --- | --- |
 | `devkita64` | devkitPro's devkitA64 image updated to GCC 16, with libnx, the Switch CMake and pkg-config wrappers, and the host tools native-deps needs |
-| `ounce` | `devkita64` with ouncebrew's Switch 2 SDK beside libnx: libounce, ouncevk and libkaihen from `pkg.ouncebrew.org`, drako3d built into libounce, and uam2, drakotools and glslang on the path |
+| `ounce` | `devkita64` turned into a Switch 2 devkit: libounce, ouncevk and libkaihen from `pkg.ouncebrew.org` with `libnx` a link to libounce, the Switch 1 portlibs removed except mbedtls and zlib, drako3d built into libounce, and uam2, drakotools and glslang on the path |
