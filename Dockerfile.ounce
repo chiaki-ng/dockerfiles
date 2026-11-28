@@ -51,8 +51,10 @@ RUN curl -fsSL -o /tmp/ounce.gpg "${OUNCE_REPO}/ounce.gpg" \
     && dkp-pacman-key --lsign-key DFEAE7FA965D1E6C0D41D4D75DB9FDBFA4A4DE29 \
     && rm /tmp/ounce.gpg \
     && printf '\n[ounce]\nServer = %s\n' "${OUNCE_REPO}" >> /opt/devkitpro/pacman/etc/pacman.conf \
-    && dkp-pacman -Sy --needed --noconfirm libounce ouncevk libkaihen \
-    && dkp-pacman -Scc --noconfirm \
+    && awk '/^\[/ { keep = ($0 == "[options]") } keep' /opt/devkitpro/pacman/etc/pacman.conf > /opt/devkitpro/pacman/etc/ounce.conf \
+    && printf '\n[ounce]\nServer = %s\n' "${OUNCE_REPO}" >> /opt/devkitpro/pacman/etc/ounce.conf \
+    && dkp-pacman --config /opt/devkitpro/pacman/etc/ounce.conf -Sy --needed --noconfirm libounce ouncevk libkaihen \
+    && dkp-pacman --config /opt/devkitpro/pacman/etc/ounce.conf -Scc --noconfirm \
     && test -f "${DEVKITPRO}/libounce/lib/libounce.a"
 
 RUN dkp-pacman -Qq \
