@@ -274,8 +274,9 @@ jobs:
             printf 'Built on `%s`.\n\n' "$built_on"
             local script="report/${dockerfile#Dockerfile.}.sh"
             if [ -f "$script" ]; then
+              printf '<details>\n<summary>%s toolchain and packages</summary>\n\n' "$image"
               docker run --rm -v "$PWD/report:/report:ro" "$REGISTRY/$image@$digest" bash "/report/${script##*/}" | sed 's/^## /### /'
-              printf '\n'
+              printf '\n</details>\n\n'
             fi
           }
           notes="$RUNNER_TEMP/notes.md"
