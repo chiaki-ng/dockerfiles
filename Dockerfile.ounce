@@ -29,7 +29,7 @@ RUN git clone -q https://github.com/ouncebrew/uam2.git /tmp/uam2 \
 FROM ${BASE}
 
 LABEL org.opencontainers.image.source="https://github.com/chiaki-ng/dockerfiles"
-LABEL org.opencontainers.image.description="akira builder with libnx for Switch 1 and libounce for Switch 2"
+LABEL org.opencontainers.image.description="devkita64 with the libounce Switch 2 SDK beside libnx"
 
 ARG OUNCE_REPO=https://pkg.ouncebrew.org
 ARG DRAKOTOOLS_COMMIT=b32fe6e43533e80414f6aa4ad3b899ed077f806c
